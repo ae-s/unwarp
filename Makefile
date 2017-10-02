@@ -1,6 +1,8 @@
 
 # These are rules which don't correspond to an actual file
-.PHONY: calibrate flatten cleanup
+.PHONY: calibrate flatten
+
+export MAGICK_TMPDIR=/tmp/3
 
 # We maybe don't want to keep all these huge bitmaps lying around
 #.INTERMEDIATE: out/%.ppm orig/%.ppm
@@ -16,9 +18,9 @@ calibrate: cal-even.deformation cal-odd.deformation ppmunwarp
 # Also creates a [thing]-check.ppm file, in case you're interested in
 # what the machine sees.
 %.deformation: %.ppm
-	./ppmunwarp -cc $< -d $@ -m $*-check.ppm
+	/idk/astrid/unwarp/ppmunwarp -cc $< -d $@ -m $*-check.ppm
 
-# We can create a ppm from a jpeg.
+# We can create a ppm from an otherwise identically named jpeg.
 %.ppm: %.jpg
 	convert $< $@
 
@@ -27,22 +29,25 @@ calibrate: cal-even.deformation cal-odd.deformation ppmunwarp
 #	convert $< $@
 
 
-# Here's a rule to unwarp a single image.
+# Here's the ruleset to unwarp a single image.
 #
 # Determining whether a number is even or odd, in the year 2017,
 # requires spawning two (three?) new processes and using a regular
 # expression.
-#
-# TODO: rotate the image correctly
-out/%.png: in/%.jpg
-	convert $< in-$*.ppm
-	./ppmunwarp -i in-$*.ppm -o dew-$*.ppm -d cal-`echo $* | sed -e 's/.*\(.\)/\1/' -e 's/[02468]/even/' -e 's/[13579]/odd/' `.deformation
-	pnmflip `echo $* | sed -e 's/.*\(.\)/\1/' -e 's/[02468]/-ccw/' -e 's/[13579]/-cw/' ` dew-$*.ppm > out-$*.ppm
-	convert out-$*.ppm $@
-	rm -f in-$*.ppm dew-$*.ppm out-$*.ppm
 
-RENAME = $(basename $(1)).png
+%.in.ppm: in/%.jpg
+	convert $< $@
 
-flatten: calibrate $(addsuffix .png,$(basename [0-9]*.jpg))
+%.dew.ppm: %.in.ppm
+	/idk/astrid/unwarp/ppmunwarp -i $< -o $@ \
+		-d cal-`echo $* | sed -e 's/.*\(.\)/\1/' -e 's/[02468]/even/' -e 's/[13579]/odd/' `.deformation
 
-all: calibrate flatten cleanup
+%.out.ppm: %.dew.ppm
+	pnmflip `echo $* | sed -e 's/.*\(.\)/\1/' -e 's/[02468]/-ccw/' -e 's/[13579]/-cw/' ` $< > $@
+
+out/%.png: %.out.ppm
+	convert $< $@
+
+flatten: calibrate $(addprefix out/,$(notdir $(addsuffix .png,$(basename $(wildcard in/[0-9]*.jpg)))))
+
+all: calibrate flatten
