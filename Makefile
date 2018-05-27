@@ -10,6 +10,8 @@ export MAGICK_TMPDIR=/tmp/3
 # There is a tool ... which make knows how to compile ...
 ppmunwarp: ppmunwarp.cc
 
+ppmwhitebalance: ppmwhitebalance.cc
+
 # Calibration requires the creation of an even and an odd deformation
 # map.  This indirectly requires the files `even.jpg' and `odd.jpg'.
 calibrate: cal-even.deformation cal-odd.deformation ppmunwarp
