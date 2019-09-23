@@ -59,6 +59,12 @@
 // If one of the last two options is zero, that value is choosen
 // approximately considering the aspect ratio of the image.
 //
+// All pixels outside the rectangle given by the parameters
+// -gx, -gy, -gw, -gh are set to the RGB mean value of this rectangle.
+// If -go specifies a percentage parameter less then 100, then all
+// colors which differ by more than this percentage with respect to
+// the total color variation are also set to the mean value.
+//
 // If 'page01.ppm' is one of the images of the camera to be color
 // adjusted, this can be achieved by:
 //
@@ -79,52 +85,18 @@
 
 // ============================================================================
 
-// Include files; no other libraries needed than 'libgpp':
+// Include files; no other libraries needed than 'libgpp' and 'ppmroselib.o':
 
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <ctype.h>
-#include <stdarg.h>
-#include <math.h>
-#include <new>
+#include "ppmroselib.h"
 
-#define VERSION "1.3"
+// ============================================================================
 
-// ----------------------------------------------------------------------------
+// We limit the number of grid points, otherwise the
+// band matrix solver will become too expensive:
 
-// Example to compile successfully under Visual C++ 6.0 with
-// cl -GX ppmwhitebalance.cpp
+#define MAX_DOF  100000
 
-#ifdef _WIN32
-  typedef unsigned __int8   u_int8_t;
-  typedef unsigned __int16  u_int16_t;
-  typedef unsigned __int32  u_int32_t;
-  inline double round(double z) { return floor(z+0.5); }
-  #include <io.h>
-  #include <fcntl.h>
-  #define binmode(fh) _setmode(_fileno(fh),_O_BINARY)
-#else
-  #define binmode(fh)
-#endif
-
-// ----------------------------------------------------------------------------
-
-// Global types:
-
-typedef u_int16_t pixel_t;  // Type for RGB components of a pixel.
-typedef u_int16_t color_t;  // Type for (r,g,b)-components of color grid.
-
-typedef unsigned long ulong;
-
-// ----------------------------------------------------------------------------
-
-// Global variables:
-
-const  int  nGlbBuf = 4096;
-static char glbBuf[nGlbBuf];  // Used for different purposes.
-
-// ----------------------------------------------------------------------------
+// ============================================================================
 
 // Howto obtain gray values:
 
@@ -134,23 +106,22 @@ static char glbBuf[nGlbBuf];  // Used for different purposes.
   value += 0.114 * double(*ptr++)
 
 // ============================================================================
+// Global parameters/options.
+// ============================================================================
 
-// Global parameters/options:
-
-struct Parameter {
-
-  // Program name:
-  const char *prgName;
-
-  // Suppression of normal messages:
-  int quiet;
+struct ParameterWhiteBalance : Parameter
+{
+  // Calibration mode enforced:
+  int doCalib;
 
   // File names:
-  const char *calibPicName;    // Input image with gray card.
-  const char *calibTextName;   // Calibration grid in text format.
-  const char *calibColorName;  // Final color grid.
-  const char *sourcePicName;   // Skewed input image.
-  const char *destPicName;     // Unwarped output image.
+  const char *calibPicName;          // Input image with gray card.
+  const char *calibCheckAreaName;    // Control image for area detection.
+  const char *calibCheckExtendName;  // Control image for extension.
+  const char *calibTextName;         // Calibration grid in text format.
+  const char *calibColorName;        // Final color grid.
+  const char *sourcePicName;         // Skewed input image.
+  const char *destPicName;           // Unwarped output image.
 
   // Should adjustment only act on brightness:
   int colorBrightness;
@@ -160,6 +131,12 @@ struct Parameter {
 
   // Desired gray RGB value of gray card (16 <= grayCard <= 240):
   int grayCard;
+
+  // Upper left corner and width/height of gray card area:
+  int gridX, gridY, gridW, gridH;
+
+  // Percentage of allowed color variation in rectangle:
+  int gridOffset;
 
   // Maximal multiplicator for RGB values:
   double colorFactor;
@@ -176,465 +153,224 @@ struct Parameter {
   // Output color depth per channel:
   int outputDepth;
 
-  Parameter();
-  void Usage(int exitCode);
-  void operator()(int argc, char *argv[]);
+  ParameterWhiteBalance() : Parameter("ppmwhitebalance") { }
+
+  void Define();
+  void Check();
 };
 
-static Parameter param;  // Program parameters are global for ease of use.
+// ----------------------------------------------------------------------------
+
+// Program parameters are global for ease of use:
+
+static ParameterWhiteBalance param;
+
+int main(int argc, char *argv[]) { return Handler(argc, argv, param); }
 
 // ----------------------------------------------------------------------------
 
-// Standard values for global parameters:
-
-Parameter::Parameter() {
-  prgName         = "ppmwhitebalance";
-  quiet           = 0;
-  calibPicName    = 0;
-  calibTextName   = 0;
-  calibColorName  = 0;
-  sourcePicName   = 0;
-  destPicName     = 0;
-  colorBrightness = 0;
-  gridLinear      = 0;
-  grayCard        = 128;
-  colorFactor     = 1.5;
-  colorDivisor    = 1.5;
-  gridNX          = 0;
-  gridNY          = 0;
-  outputDepth     = 0;
-}
-
-// ----------------------------------------------------------------------------
-
-// Usage/help information:
-
-void Parameter::Usage(int exitCode) {
-  if (exitCode < 0) {
-    fprintf(stdout,
-            "%s " VERSION "\n\n"
-            "Copyright (C) 2013 Michael Rose\n"
-            "License GPLv3+: GNU GPL version 3 or later"
-            " <http://gnu.org/licenses/gpl.html>\n"
-            "This is free software: you are free to change"
-            " and redistribute it.\n"
-            "There is NO WARRANTY, to the extent permitted by law.\n\n",
-            prgName);
-    exit(0);
-  }
-  fprintf(stderr,
-    "Usage: %s [options] [--] [inpname or stdin]\n\n"
-    "Options:\n"
-    "  --version     Print program version.\n"
-    "  -h            Print program usage.\n"
-    "  -q            Suppress normal program messages.\n"
-    "  -c            Enforce calibration mode.\n"
-    "  -cc (inpname) Set input PPM picture with gray card calibration image.\n"
-    "  -cp <name>    Set file name for textual calibration factors.\n"
-    "  -d  (stdout)  Set file name for binary color grid.\n"
-    "  -i  (inpname) Set input file name.\n"
-    "  -o  (stdout)  Set ouput file name.\n"
-    "  -gb           Only change brightness of color.\n"
-    "  -g1           Maximum order of interpolation is linear.\n"
-    "  -gc (128)     Set the desired RGB gray card value.\n"
-    "                A zero value indicates picture mean gray value.\n"
-    "  -gm (1.5)     Set maximal multiplicator for RGB values.\n"
-    "  -gd (1.5)     Set maximal divisor       for RGB values.\n"
-    "  -nx (0)       Number of grid points in x-direction (1 if nx=ny=0).\n"
-    "  -ny (0)       Number of grid points in y-direction (1 if nx=ny=0).\n"
-    "                If nx or ny is zero, the image aspect ratio is used.\n"
-    "  -od (0)       Output color depth, zero means same as input depth.\n\n"
+void ParameterWhiteBalance::Define()
+{
+  AddFlag("-c",  doCalib, 0,
+          "Enforce calibration mode");
+  AddString("-cc", calibPicName, 0, "(inpname)",
+            "Set input PPM picture with gray card calibration image");
+  AddString("-ma", calibCheckAreaName, 0, "<name>",
+            "Set output PPM picture with red marked detected gray area");
+  AddString("-me", calibCheckExtendName, 0, "<name>",
+            "Set output PPM picture with checked gray extension");
+  AddString("-cp", calibTextName, 0, "<name>",
+            "Set file name for textual color grid");
+  AddString("-d", calibColorName, 0, "(stdout)",
+            "Set file name for binary color grid");
+  AddString("-i", sourcePicName, 0, "(inpname)",
+            "Set input file name");
+  AddString("-o", destPicName, 0, "(stdout)",
+            "Set output file name");
+  AddFlag("-gb", colorBrightness, 0,
+          "Only change brightness of color");
+  AddFlag("-g1", gridLinear, 0,
+          "Maximum order of interpolation is linear");
+  AddInt("-gc", grayCard, 10, 128, 0, 240, 0,
+         "Set the desired RGB gray card value.\n"
+         "A zero value indicates picture mean gray value");
+  AddInt("-gx", gridX, 10, 0, 0, 24999, 0,
+         "X-coordinate of gray card area");
+  AddInt("-gy", gridY, 10, 0, 0, 24999, 0,
+         "Y-coordinate of gray card area");
+  AddInt("-gw", gridW, 10, 0, -24999, 25000, 0,
+         "Width of gray card area (0 means maximum width)");
+  AddInt("-gh", gridH, 10, 0, -24999, 25000, 0,
+         "Height of gray card area (0 means maximum width)");
+  AddInt("-go", gridOffset, 10, 100, 0, 100, 0,
+         "Percentage of color step which separates areas");
+  AddDouble("-gm", colorFactor, 255.0, 1.0, 255.0, 0,
+            "Set maximal multiplicator for RGB values");
+  AddDouble("-gd", colorDivisor, 255.0, 1.0, 255.0, 0,
+            "Set maximal divisor       for RGB values");
+  AddInt("-nx", gridNX, 10, 0, 1, 1000, 0,
+         "Number of grid points in x-direction (1 if nx=ny=0)");
+  AddInt("-ny", gridNY, 10, 0, 1, 1000, 0,
+         "Number of grid points in y-direction (1 if nx=ny=0).\n"
+         "If nx or ny is zero, the image aspect ratio is used");
+  AddInt("-od", outputDepth, 10, 0, 0, 65535, 0,
+         "Output color depth, zero means same as input depth");
+  ExtraUsage(
     "Simple calibration:  ppwhitebalance calib.ppm > color.bin\n"
-    "Simple usage:        ppwhitebalance -d color.bin src.ppm > dst.ppm\n",
-    prgName);
-  exit(exitCode);
+    "Simple usage:        ppwhitebalance -d color.bin src.ppm > dst.ppm");
 }
 
 // ----------------------------------------------------------------------------
 
-// Sets global parameters/options from the command line:
+// Special argument checking:
 
-void Parameter::operator()(int argc,char *argv[]) {
-  const char *inpName = 0;
-  const char **doName = 0;
-  int doOpt = 1, doCalib = 0, *doNumber = 0, argi;
-  double *doReal = 0;
-  char   *end;
-  for (argi = 1; argi < argc; ++argi) {
-    char *arg = argv[argi];
-    if (!*arg) Usage(1);
-    if (doName) { *doName = arg;  doName = 0; }
-    else if (doNumber) {
-      long  z = strtol(arg, &end, 10);
-      if (z < (doNumber == &grayCard    ? 0     :
-               doNumber == &outputDepth ? 0     : 1)    ||
-          z > (doNumber == &grayCard    ? 240   :
-               doNumber == &outputDepth ? 65535 : 1000) ||
-          (doNumber == &grayCard && z && z < 16))  Usage(1);
-      *doNumber = int(z);
-      doNumber  = 0; }
-    else if (doReal) {
-      double z = strtod(arg, &end);
-      if (z < 1.0 || z > 16.0)  Usage(1);
-      *doReal = z;
-      doReal  = 0; }
-    else if (doOpt && *arg == '-') {
-      if      (!strcmp(arg, "--version")) Usage(-1);
-      else if (!strcmp(arg, "--"))        doOpt = 0;
-      else if (!strcmp(arg, "-h"))        Usage(0);
-      else if (!strcmp(arg, "-q"))        quiet           = 1;
-      else if (!strcmp(arg, "-c"))        doCalib         = 1;
-      else if (!strcmp(arg, "-cc"))       doName          = &calibPicName;
-      else if (!strcmp(arg, "-cp"))       doName          = &calibTextName;
-      else if (!strcmp(arg, "-d"))        doName          = &calibColorName;
-      else if (!strcmp(arg, "-i"))        doName          = &sourcePicName;
-      else if (!strcmp(arg, "-o"))        doName          = &destPicName;
-      else if (!strcmp(arg, "-gb"))       colorBrightness = 1;
-      else if (!strcmp(arg, "-g1"))       gridLinear      = 1;
-      else if (!strcmp(arg, "-gc"))       doNumber        = &grayCard;
-      else if (!strcmp(arg, "-gm"))       doReal          = &colorFactor;
-      else if (!strcmp(arg, "-gd"))       doReal          = &colorDivisor;
-      else if (!strcmp(arg, "-nx"))       doNumber        = &gridNX;
-      else if (!strcmp(arg, "-ny"))       doNumber        = &gridNY;
-      else if (!strcmp(arg, "-od"))       doNumber        = &outputDepth;
-      else  Usage(1);
-    } else {
-      if (argi+1 != argc || !*arg)  Usage(1);
-      inpName = arg;
-  } }
-  if (doName || doNumber || doReal)  Usage(1);
-  // Check options and set missing file names for calibration/convert mode:
-  argi = 0;
-  if (calibPicName)    argi++;
-  if (calibTextName)   argi++;
-  if (calibColorName)  argi++;
-  if (argi != 1)  doCalib = 1;
+void ParameterWhiteBalance::Check()
+{
+  int n = 0;
+  if (grayCard && grayCard < 16)  Usage(1);
+  if (calibPicName)    ++n;
+  if (calibTextName)   ++n;
+  if (calibColorName)  ++n;
+  if (n != 1 || calibCheckAreaName || calibCheckExtendName)  doCalib = 1;
   if (doCalib) {
     if (sourcePicName || destPicName)  Usage(1);
     if (calibPicName) { if (inpName)  Usage(1); }
     else if (inpName) { calibPicName = inpName; }
-    if (!calibPicName && !calibTextName) calibPicName = "";
+    if (!calibPicName &&
+        (calibCheckAreaName || calibCheckExtendName || !calibTextName))
+      calibPicName = "";
     if (!calibColorName && (!calibPicName || !calibTextName))
-      calibColorName = "";
-  } else {
+      calibColorName = ""; }
+  else {
     if (!sourcePicName)  sourcePicName = inpName ? inpName : "";
     else if (inpName)    Usage(1);
-    if (!destPicName)    destPicName = "";
-  }
+    if (!destPicName)    destPicName = ""; }
   if (!gridNX && !gridNY)  gridNX = gridNY = 1;
-}
-
-// ============================================================================
-// General common functions:
-// ----------------------------------------------------------------------------
-
-// Error message with program termination:
-
-static void Error(const char *format, ...) {
-  va_list ap;
-  va_start(ap, format);
-  vsprintf(glbBuf, format, ap);  // Hopefully this fits (long filenames)!
-  va_end(ap);
-  throw glbBuf;
-}
-
-// Normal messages, which can be suppressed:
-
-static void Print(const char *format, ...) {
-  if (!param.quiet) {
-    va_list ap;
-    va_start(ap, format);
-    vfprintf(stderr, format, ap);
-    va_end(ap);
-} }
-
-// ============================================================================
-
-// Onedimensional constant/linear/cubic interpolation:
-//
-// 'f[4]' contains up to four interpolation coefficients, depending on
-// the fraction between the aequidistant grid points. 'm' is the maximum
-// possible grid index (between 0 and 'm'), 'o' the row/column offset
-// to adjust the grid pointer for adjacent rows/columns. 'r = 1' indicates
-// that the weighting process should start one step before the current
-// row/column and 'n' denotes the valid coefficients 'f[0 ... n]'.
-// 'o2' is another offset suitable to create system matrices.
-// The cubic interpolation is valid for 'm >= 2'.
-// The interpolation changes automatically to linear order, if 'm < 2'
-// and to constant order if 'm == 0'.
-
-struct Cubic1 {
-  double f[4];
-  long   order, m, mm, o, o2, n, r;
-  void SetSize(long m) {
-    this->m = m;
-    order   = m < 2 ? m : (param.gridLinear ? 1 : 3);
-    mm      = m ? m : 1; }
-  Cubic1(long m, long o) { SetSize(m);  this->o = o; }
-  Cubic1(long m, long o, long o2) { SetSize(m); this->o = o; this->o2 = o2; }
-  long operator()(double t1);
-};
-
-// ----------------------------------------------------------------------------
-
-// Initializes interpolation at location '0.0 <= t1 <= m'.
-// The interpolation is C1-continuous if 'order == 3':
-
-long Cubic1::operator()(double t1) {
-  double t0 = floor(t1);
-  long   i  = long(t0);
-  t1 -= t0;
-  if (i >= mm) { --i;  t1 += 1.0; }  // Border case.
-  switch (order) {
-    case 0:   f[n = r = 0] = 1.0;                   break;
-    case 1:   f[r = 0] = 1.0 - t1;  f[n = 1] = t1;  break;
-    default:
-      t0 = 1.0 - t1;
-      if (i) {
-        if (i == m - 1) {  // Highest grid interval:
-          f[    0] = -0.5 * t0 * t1;
-          f[r = 1] =       t0 * (2.0 - t0);
-          f[n = 2] = 0.5 * t1 * (2.0 - t0); }
-        else {  // General grid interval:
-          f[    0] = -0.5 * t0 * t0 * t1;
-          f[r = 1] = -t0 * (((1.5 * t1) - 1.0) * t1 - 1.0);
-          f[    2] = -t1 * (((1.5 * t0) - 1.0) * t0 - 1.0);
-          f[n = 3] = -0.5 * t1 * t1 * t0; } }
-      else {  // Lowest grid interval:
-        f[r = 0] = 0.5 * t0 * (2.0 - t1);
-        f[    1] =       t1 * (2.0 - t1);
-        f[n = 2] = -0.5 * t0 * t1; } }
-  return i;
-}
-
-// ----------------------------------------------------------------------------
-
-// Twodimensional constant/linear/cubic interpolation:
-
-template<class ityp>
-struct Cubic2 {
-  Cubic1 cx,cy;  // Onedimensional interpolation along x-axis and y-axis.
-  Cubic2(long mx, long ox, long my, long oy) : cx(mx, ox), cy(my, oy) { }
-  Cubic2(long mx, long ox, long ox2, long my, long oy, long oy2) :
-    cx(mx, ox, ox2), cy(my, oy, oy2) { }
-  double operator()(ityp *raw);
-  void AssembleRhs(double scale, double *rhs);
-  void AssembleMat(double *mat);
-};
-
-// ----------------------------------------------------------------------------
-
-// Returns interpolated value for previously specified grid point
-// in the cell, whose lower left pointer is given by 'raw':
-//
-// The interpolation on a rectangular grid has
-// the tensor product property.
-
-template<class ityp>
-double Cubic2<ityp>::operator()(ityp *raw) {
-  double  value = 0.0;
-  long    ix,iy;
-  ityp   *r;
-  if (cx.r)  raw -= cx.o;
-  if (cy.r)  raw -= cy.o;
-  for (ix=0; ix <= cx.n; ++ix, raw += cx.o) {
-    for (iy=0, r=raw; iy <= cy.n; ++iy, r += cy.o) {
-      value += double(*r) * (cx.f[ix] * cy.f[iy]); } }
-  return value;
-}
-
-// ----------------------------------------------------------------------------
-
-// Assembles right hand side vector "G' * rhs":
-
-template <class ityp>
-void Cubic2<ityp>::AssembleRhs(double scale, double *rhs) {
-  long   ix, iy;
-  double *p, v;
-  if (cx.r) rhs -= cx.o;
-  if (cy.r) rhs -= cy.o;
-  for (ix=0; ix <= cx.n; ++ix, rhs += cx.o) {
-    v = scale * cx.f[ix];
-    for (iy=0, p=rhs; iy <= cy.n; ++iy, p += cy.o) {
-      *p += v * cy.f[iy]; } }
-}
-
-// ----------------------------------------------------------------------------
-
-// Assembles full or band system matrix "G' * G":
-
-template <class ityp>
-void Cubic2<ityp>::AssembleMat(double *mat) {
-  long   ix, iy, ix2, iy2;
-  double *p1, *p2, *p3, v1, v2, v3;
-  if (cx.r) mat -= cx.o + cx.o2;
-  if (cy.r) mat -= cy.o + cy.o2;
-  for (ix=0; ix <= cx.n; ++ix, mat += cx.o) {
-    v1 = cx.f[ix];
-    for (iy=0, p1=mat; iy <= cy.n; ++iy, p1 += cy.o) {
-      v2   = v1 * cy.f[iy];
-      for (ix2=0, p2=p1; ix2 <= cx.n; ++ix2, p2 += cx.o2) {
-        v3 = v2 * cx.f[ix2];
-        for (iy2=0, p3=p2; iy2 <= cy.n; ++iy2, p3 += cy.o2) {
-          *p3 += v3 * cy.f[iy2]; } } } }
 }
 
 // ============================================================================
 
 // Type for image data:
 
-struct Picture {
-  long     width,   // Image width
-           height,  // Image height
-           depth,   // Maximum color value per channel.
-           size;    // 3 * width * height, each pixel has RGB-tripel.
-  pixel_t *pixel;   // 3 * width * height RGB values (16 bit).
-
-  Picture()  { pixel = 0;  Reset(); }
-  ~Picture() {             Reset(); }
-
-  void Reset(long width=0, long height=0, long depth=255);
-  void Read(const char *filename, FILE *fh=0);
-  void Write(const char *filename, FILE *fh=0);
-  int  GetMeanValue();
+struct Picture : Image
+{
+  long gridX, gridY, gridW, gridH;
+  void Write(const char *filename, FILE *fh=0) {
+    Image::Write(filename, fh, param.prgName); }
+  void SetRectangle(long x=0, long y=0, long w=0, long h=0);
+  void ExtendArea(int offset);
+  void SaveCheckArea(const char *filename, long nx, long ny);
+  void SaveCheckExtend(const char *filename);
+  int  GetMeanValue255();
 };
 
 // ----------------------------------------------------------------------------
 
-// Resizes the image array by given size parameters:
-
-void Picture::Reset(long width, long height, long depth) {
-  if (pixel)  delete pixel;
-  this->width  = width;
-  this->height = height;
-  this->depth  = depth;
-  size         = 3 * width * height;
-  pixel        = 0;
-  if (size)  pixel = new pixel_t[size];
-}
-
-// ----------------------------------------------------------------------------
-
-// Read raw PPM image file:
-
-void Picture::Read(const char *filename, FILE *fh)
+void Picture::SetRectangle(long x, long y, long w, long h)
 {
-  int      mode = 0, ch = 0;
-  long     z = 0, n, m;
-  u_int8_t buf[4096], *src;
-  pixel_t  val,       *dst;
-  if (fh != stdin)  fh = fopen(filename, "rb");
-  else              binmode(fh);  // Windows.
-  if (!fh)  Error("Couldn't read '%s' as raw PPM image file", filename);
-  try {
-    // Read preamble of PPM file:
-    while (mode != 5) {
-      // Do we need a next character?
-      if      (mode & 64)                mode &= 63;
-      else if ((ch = fgetc(fh)) == EOF)  throw 1;
-      // Do we need to read space with comments?
-      if (mode & 8) {
-        if (isspace(ch)) {
-          mode |= 16;  // We have seen at least one space/comment.
-          if (ch == '\n')  mode &= 31;
-          continue; }
-        else if (ch == '#') { mode |= 48;  continue; }
-        else {
-          if (mode & 32)  continue;   // Ignore comment characters in line.
-          if (!(mode & 16)) throw 1;  // Was there a separation?
-          // Switch to number reading:
-          mode &= 23; } }
-      // Do we need to read a number?
-      if (mode & 16) {
-        if (!(mode & 32))  z = 0;  // Initialize at beginning.
-        if (ch >= '0' && ch <= '9') {
-          mode |= 32;  // We have seen at least one digit.
-          z     = 10 * z + (ch - '0');
-          if (z > 65535)  throw 1;
-          continue; }
-        if (!(mode & 32))  throw 1;  // We need at least one digit.
-        // Switch to global parsing mode:
-        mode &= 7; }
-      // Main parsing of preamble:
-      switch (mode) {
-        case 0:   if (ch == 'P') { mode =  1;  continue; }  throw 1;
-        case 1:   if (ch == '6') { mode = 10;  continue; }  throw 1;
-        case 2:   width  = z;  mode = 75;  continue;
-        case 3:   height = z;  mode = 76;  continue;
-        default:  depth  = z;  mode =  5; } }
-    // Now the preamble has been consumed, check for final space character:
-    if (width > 25000 || height > 25000 || !depth || !isspace(ch))  throw 1;
-    Reset(width, height, depth);
-    // Read binary data; either 8bit or 16bit RGB channel values:
-    n   = size;
-    dst = pixel;
-    if (depth > 255) {
-      while (n) {
-        n -= m = n < 2048 ? n : 2048;
-        if (fread((src = buf), sizeof(u_int8_t) << 1, m, fh) != ulong(m))
-          throw 2;
-        while (m--) {
-          val    = pixel_t(*src++);
-          *dst++ = val = (val << 8) | pixel_t(*src++);
-          if (val > depth)  throw 4; } } }
-    else {
-      while (n) {
-        n -= m = n < 4096 ? n : 4096;
-        if (fread((src = buf), sizeof(u_int8_t), m, fh) != ulong(m))
-          throw 2;
-        while (m--) {
-          *dst++ = val = pixel_t(*src++);
-          if (val > depth)  throw 4; } } }
-    if (fgetc(fh) != EOF)  throw 3;
-    if (fh != stdin)  fclose(fh); }
-  catch (int nmr) {
-    const char *msg;
-    if (fh != stdin)  fclose(fh);
-    switch (nmr) {
-      case 1:   msg = "has wrong preamble";     break;
-      case 2:   msg = "is too small";           break;
-      case 3:   msg = "is too big";             break;
-      default:  msg = "has wrong color depth";  }
-    Error("PPM image file '%s' %s", filename, msg); }
+  if (x >= width)      x = width  - 1;
+  if (y >= height)     y = height - 1;
+  if (x <  0)          x = 0;
+  if (y <  0)          y = 0;
+  if (w <= 0)          w = width  - x + w;
+  if (h <= 0)          h = height - y + h;
+  if (w <= 0)          w = 1;
+  if (h <= 0)          h = 1;
+  if (x + w > width)   w = width  - x;
+  if (y + h > height)  h = height - y;
+  gridX = x;
+  gridY = y;
+  gridW = w;
+  gridH = h;
 }
 
 // ----------------------------------------------------------------------------
 
-// Write raw PPM image file:
-
-void Picture::Write(const char *filename, FILE *fh)
+void Picture::ExtendArea(int offset)
 {
-  long     n, m, k;
-  u_int8_t buf[4096], *dst;
-  pixel_t  val,       *src;
-  if (fh != stdout)  fh = fopen(filename, "wb");
-  else               binmode(fh);  // Windows.
-  if (!fh) Error("Couldn't write '%s' as raw PPM image file", filename);
-  fprintf(fh, "P6\n# CREATOR: %s\n%ld %ld\n%ld\n",
-          param.prgName, width, height, depth);
-  n   = size;
-  src = pixel;
-  if (depth > 255) {
-    while (n) {
-      n   -= m = k = n < 2048 ? n : 2048;
-      dst  = buf;
-      while (k--) {
-        val    = *src++;
-        *dst++ = u_int8_t(val >> 8);
-        *dst++ = u_int8_t(val & 255); }
-      fwrite(buf, sizeof(u_int8_t) << 1, m, fh); } }
-  else {
-    while (n) {
-      n   -= m = k = n < 4096 ? n : 4096;
-      dst  = buf;
-      while (k--)  *dst++ = u_int8_t(*src++);
-      fwrite(buf, sizeof(u_int8_t), m, fh); } }
-  if (fh != stdout)  fclose(fh);
+  long     nn     = gridW * gridH, span = 3 * width, x, y;
+  pixel_t *base   = pixel + (3 * (width * gridY + gridX)), *raw;
+  int      mincol = 65535, maxcol = 0, meancol[3], channel, delta, value, cmp;
+  double   accu[3];
+  for (channel=0; channel< 3; ++channel)  accu[channel] = 0.0;
+  for (y=0; y < gridH; ++y,base+=span) {
+    for (x=0,raw=base; x < gridW; ++x) {
+      for (channel=0; channel < 3; ++channel) {
+        value = int(*raw++);
+        if (mincol > value)  mincol = value;
+        if (maxcol < value)  maxcol = value;
+        accu[channel] += double(value); } } }
+  for (channel=0; channel < 3; ++channel) {
+    accu[channel] /= double(nn);
+    if (accu[channel] < double(mincol))  accu[channel] = double(mincol);
+    if (accu[channel] > double(maxcol))  accu[channel] = double(maxcol);
+    meancol[channel] = int(accu[channel]); }
+  delta = maxcol - mincol;
+  if (offset < 100) {
+    delta  = int((double(delta) * double(offset)) / 100.0);
+    offset = 1; }
+  else  offset = 0;
+  for (y=0,raw=pixel; y < height; ++y) {
+    for (x=0; x < width; ++x,raw+=3) {
+      value = (gridX <= x && x < gridX + gridW &&
+               gridY <= y && y < gridY + gridH);
+      if (value && offset) {
+        for (channel=0; channel < 3; ++channel) {
+          cmp = int(raw[channel]) - meancol[channel];
+          if (cmp < -delta || delta < cmp) { value = 0;  break; } } }
+      if (!value)
+        for (channel=0; channel < 3; ++channel)
+          raw[channel] = pixel_t(meancol[channel]); } }
 }
 
 // ----------------------------------------------------------------------------
 
-int Picture::GetMeanValue() {
+// Writes a control picture to visualize the gray card area in red:
+
+void Picture::SaveCheckArea(const char *filename, long nx, long ny)
+{
+  pixel_t *src   = pixel, *dst, val;
+  double   scale = 192.0 / double(depth);
+  long     cx, cy, x, y;
+  int      channel;
+  Image    img;
+  img.Reset(width, height, 255);
+  dst = img.pixel;
+  for (y=cy=0; y < height; ++y) {
+    for (x=cx=0; x < width; ++x) {
+      for (channel=0; channel < 3; ++channel) {
+        val = pixel_t(scale * *src++);
+        if (cx <= 0 || cy <= 0 ||
+            (!channel && gridY <= y && y < gridY+gridH &&
+             gridX <= x && x < gridX+gridW))  val = 255;
+        *dst++ = val; }
+      if (cx <= 0)  cx += width - 1;
+      cx -= nx; }
+    if (cy <= 0)  cy += height - 1;
+    cy -= ny; }
+  img.Write(filename, 0, param.prgName);
+}
+
+// ----------------------------------------------------------------------------
+
+// Writes a control picture to visualize the gray card extension:
+
+void Picture::SaveCheckExtend(const char *filename)
+{
+  pixel_t *src   = pixel, *dst;
+  double   scale = 255.0 / double(depth);
+  long     n     = size;
+  Image    img;
+  img.Reset(width, height, 255);
+  dst = img.pixel;
+  while (n--)  *dst++ = pixel_t(scale * *src++);
+  img.Write(filename, 0, param.prgName);
+}
+
+// ----------------------------------------------------------------------------
+
+int Picture::GetMeanValue255()
+{
   pixel_t *ptr   = pixel;
   long     nn    = width * height, n = nn;
   double   value = 0.0;
@@ -648,114 +384,20 @@ int Picture::GetMeanValue() {
 
 // ============================================================================
 
-// System modul to solve linear equation with band matrix.
-// Matrix is of size 'n x n' with lower and upper bandwidth 'b'.
-// The offset between valid entries on adjacent columns on the
-// same row is 'o=2*b', the adjacent diagonal elements have offset 'o + 1':
-
-struct System {
-  long    n, b, o;
-  double *sol, *rhs, *mat;
-
-  System()  { sol = 0;  Reset(); }
-  ~System() {           Reset(); }
-
-  double *GetBaseMat(long i) { return mat + (o + 1) * i; }
-  double *GetBaseRhs(long i) { return rhs + i;           }
-
-  void Reset(long n=0, long b=0);
-  void ClearRhs();
-  void ClearMat();
-  void Cholesky();
-  void Solve();
-};
-
-// ----------------------------------------------------------------------------
-
-void System::Reset(long n, long b) {
-  long    size;
-  double *arr;
-  if (sol)  delete sol;
-  this->n = n;
-  this->b = b;
-  o       = b << 1;
-  size    = (o + 3) * n;
-  sol     = rhs = mat = 0;
-  if (size) {
-    sol = arr = new double[size];
-    rhs = sol + n;
-    mat = rhs + n;
-    while (size--)  *arr++ = 0.0; }
-}
-
-// ----------------------------------------------------------------------------
-
-void System::ClearRhs() {
-  long    s = n;
-  double *p = rhs;
-  while (s--)  *p++ = 0.0; }
-
-// ----------------------------------------------------------------------------
-
-void System::ClearMat() {
-  long    s = (o + 1) * n;
-  double *p = mat;
-  while (s--)  *p++ = 0.0; }
-
-// ----------------------------------------------------------------------------
-
-// Cholesky "C' * C = M" decomposition of band matrix (band is preserved):
-
-void System::Cholesky() {
-  double *pi, *pj, *pji, *pkj, *pki, s;
-  long    i, j, k, m, mo;
-  for (i=0, mo=-o, pi=mat; i < n; ++i, pi += o + 1) {
-    if (i <= b) { m = i;  mo += o; } else m = b;
-    for (j = 0, pji=pi-m, pj=pji-mo; j <= m; ++j, ++pji, pj += o+1) {
-      for (k=0, pkj=pj, pki=pji, s=*pji; k < j; ++k)  s -= *--pkj * *--pki;
-      if (j == m) {
-        if (s < 1e-14)  Error("System matrix not positive definite");
-        *pji = sqrt(s); }
-      else  *pji = s / *pj; } }
-}
-
-// ----------------------------------------------------------------------------
-
-// Solve "C' * C * sol = rhs":
-
-void System::Solve() {
-  double *ps, *pi, *pji, *pjs, s;
-  long    i, j, m;
-  for (i=0; i < n; ++i) sol[i] = rhs[i];
-  // Solve for transposed cholesky factor:
-  for (i=0, pi=mat, ps=sol; i < n; ++i, pi += o + 1) {
-    m = i <= b ? i : b;
-    for (j=0, pji=pi, pjs=ps, s=*ps; j < m; ++j)  s -= *--pji * *--pjs;
-    *ps++ = s / *pi; }
-  // Solve for cholesky factor:
-  for (i=0, pi=mat+(n-1)*(o+1), ps=sol+(n-1); i < n; ++i, pi -= o + 1) {
-    m = i <= b ? i : b;
-    for (j=0, pji=pi+o, pjs=ps, s=*ps; j < m; ++j, pji += o)
-      s -= *pji * *++pjs;
-    *ps-- = s / *pi; }
-}
-
-// ============================================================================
-
 // Conversion modul:
 
 struct Converter {
-  Picture *pic;
-  double  *map;
-  System   sys;
-  long     pn1, po1, pn2, po2;
-  long     gn1, gn2, go2, gb;
-  int      swap;
+  Picture      *pic;
+  double       *map;
+  BandedSystem  sys;
+  long          pn1, po1, pn2, po2;
+  long          gn1, gn2, go2, gb;
+  int           swap, linear;
 
   Converter()  { map = 0;  Reset(); }
   ~Converter() {           Reset(); }
 
-  void Reset(Picture* pic=0, long nx=0, long ny=0);
+  void Reset(Picture* pic=0, long nx=0, long ny=0, int linear=0);
   void SetMap(int channel = -1);
   void BuildtAndSolveSystem(int doMat=0);
   void ReadSolution(color_t *rgbMap);
@@ -765,13 +407,14 @@ struct Converter {
 
 // ----------------------------------------------------------------------------
 
-void Converter::Reset(Picture *pic, long nx, long ny) {
+void Converter::Reset(Picture *pic, long nx, long ny, int linear) {
   long size;
   if (map)  delete map;
-  this->pic = pic;
-  map       = 0;
-  pn1       = po1 = pn2 = po2 = gn1 = gn2 = go2 = gb = 0;
-  swap      = 0;
+  this->pic    = pic;
+  this->linear = linear;
+  map          = 0;
+  pn1          = po1 = pn2 = po2 = gn1 = gn2 = go2 = gb = 0;
+  swap         = 0;
   if (pic) {
     pn1 = pic->width;
     po1 = 1;
@@ -784,7 +427,7 @@ void Converter::Reset(Picture *pic, long nx, long ny) {
       po1 = pn1;  pn1 = pn2;  pn2 = po1; po1 = po2;  po2 = 1;
       go2 = gn1;  gn1 = gn2;  gn2 = go2; go2 = gn1;
       swap = 1; }
-    gb   = (param.gridLinear ? 1 : 3) * (go2 + 1);
+    gb   = (linear ? 1 : 3) * (go2 + 1);
     size = pn1 * pn2;
     map  = new double[size];
     for (long i=0; i < size; ++i)  map[i] = 0.0;
@@ -817,17 +460,19 @@ void Converter::BuildtAndSolveSystem(int doMat) {
   long    gm2    = gn2 - 1;
   double  scale1 = pn1 > 1 ? double(gm1) / double(pn1 - 1) : 1.0;
   double  scale2 = pn2 > 1 ? double(gm2) / double(pn2 - 1) : 1.0;
+  double *mat    = sys.GetMat();
+  double *rhs    = sys.GetRhs();
   double *src1, *src2;
-  long    i1, i2, k1, k2;
-  Cubic2<double>  cub(gm1, 1, 2*gb, gm2, go2, go2*(2*gb));
+  long    i1, i2;
+  Interpolation2<double>  inter(linear, gm1, 1, gm2, go2, 2*gb);
   if (doMat)  sys.ClearMat();
   else        sys.ClearRhs();
   for (i1=0, src1=map; i1 < pn1; ++i1, src1 += po1) {
-    k1 = cub.cx(scale1 * double(i1));
+    inter.cx.Set(scale1 * double(i1));
     for (i2=0, src2=src1; i2 < pn2; ++i2, src2 += po2) {
-      k2 = go2 * cub.cy(scale2 * double(i2)) + k1;
-      if (doMat)  cub.AssembleMat(sys.GetBaseMat(k2));
-      else        cub.AssembleRhs(*src2, sys.GetBaseRhs(k2)); } }
+      inter.cy.Set(scale2 * double(i2));
+      if (doMat)  inter.AssembleMat(mat);
+      else        inter.AssembleRhs(*src2, rhs); } }
   if (doMat) {
     Print("Cholesky factorization ...\n");
     sys.Cholesky(); }
@@ -844,7 +489,7 @@ void Converter::ReadSolution(color_t *rgbMap) {
   double *px, *py, z;
   if (swap) { gnx = gn2;  gox = go2;  gny = gn1;  goy = 1;   }
   else      { gnx = gn1;  gox = 1;    gny = gn2;  goy = go2; }
-  for (iy=0, py=sys.sol; iy < gny; ++iy, py += goy) {
+  for (iy=0, py=sys.GetSol(); iy < gny; ++iy, py += goy) {
     for (ix=0, px=py; ix < gnx; ++ix, px += gox) {
       z = *px;
       z = z < 0.0 ? 0.0 : z > 1.0 ? 1.0 : z;
@@ -907,7 +552,7 @@ struct Grid {
 
 void Grid::Reset(long nx, long ny) {
   size = 3 * nx * ny;
-  if (nx > 1000 || ny > 1000 || size > 30000)
+  if (nx > 1000 || ny > 1000 || size > (3*MAX_DOF))
     Error("Color grid size %ldx%ld is too high", nx, ny);
   if (rgbMap)  delete rgbMap;
   this->nx = nx;
@@ -934,14 +579,14 @@ void Grid::TextRead(const char *filename, FILE *fh) {
   try {
     if (fscanf(fh, "Colorcalibrationgrid %ld %ld\n", &ix, &iy) != 2 ||
         ix <= 0 || iy <= 0 || ix > 1000 || iy > 1000 ||
-        ix * iy > 10000)  throw 0;
+        ix * iy > MAX_DOF)  throw 0;
     Reset(ix, iy);
     if (fscanf(fh, "Onlylinear %d\n", &linear) != 1 ||
         linear < 0 || linear > 1)  throw 0;
     if (fscanf(fh, "Target %d\n", &target) != 1 || target < 16 || target > 240)
       throw 0;
     if (fscanf(fh, "Factor %x %x ", &z, &zz) != 2 ||
-        z < 4096 || z > 1048576 || zz < 4096 || zz > 1048576)  throw 0;
+        z < 257 || z > 16711680 || zz < 257 || zz > 16711680)  throw 0;
     smin = u_int32_t(z);
     smax = u_int32_t(zz);
     while (!feof(fh))  if (fgetc(fh) == '\n')  break;
@@ -962,8 +607,6 @@ void Grid::TextRead(const char *filename, FILE *fh) {
     const char *msg = nmr ? "has wrong point syntax" : "has wrong preamble";
     if (fh != stdin)  fclose(fh);
     Error("Calibration color file '%s' %s", filename, msg); }
-  // Set global parameter for interpolation restriction:
-  param.gridLinear = linear;
 }
 
 // ----------------------------------------------------------------------------
@@ -1009,21 +652,19 @@ void Grid::Read(const char *filename, FILE *fh) {
       fread(&target, sizeof(int), 1, fh) != 1 ||
       target < 16 || target > 240 ||
       fread(&smin, sizeof(u_int32_t), 1, fh) != 1 ||
-      smin < 4096 || smin > 1048576 ||
+      smin < 257 || smin > 16711680 ||
       fread(&smax, sizeof(u_int32_t), 1, fh) != 1 ||
-      smax < 4096 || smax > 1048576 ||
+      smax < 257 || smax > 16711680 ||
       smin > smax)  magic = 0;
   if (magic) {
     size = 3 * nx * ny;
-    if (size <= 30000) {
+    if (size <= (3*MAX_DOF)) {
       rgbMap = new color_t[size];
       if (fread(rgbMap, sizeof(color_t), size, fh) != ulong(size))
         magic = 0; }
     else magic = 0; }
   if (fh && fh != stdin)  fclose(fh);
   if (!magic) Error("Couldn't read color grid file '%s'", filename);
-  // Set global parameter for interpolation restriction:
-  param.gridLinear = linear;
 }
 
 // ----------------------------------------------------------------------------
@@ -1061,17 +702,26 @@ void Grid::Calibrate(Picture& pic) {
   if (nx > pic.width)   nx = pic.width;
   if (ny > pic.height)  ny = pic.height;
   Print("Calibration grid: %ld x %ld\n", nx, ny);
-  if (!param.grayCard) {
-    param.grayCard = pic.GetMeanValue();
-    Print("Automatic graycard value: %d\n", param.grayCard); }
   Reset(nx, ny);
-  converter.Reset(&pic, nx, ny);
-  converter.GetRgbMap(rgbMap);
+  // Set gray card area due to rectangle restriction:
+  pic.SetRectangle(param.gridX, param.gridY, param.gridW, param.gridH);
+  if (param.calibCheckAreaName)
+    pic.SaveCheckArea(param.calibCheckAreaName, nx, ny);
+  // Set gray card area due to color variation:
+  pic.ExtendArea(param.gridOffset);
+  if (param.calibCheckExtendName)
+    pic.SaveCheckExtend(param.calibCheckExtendName);
+  if (!param.grayCard) {
+    param.grayCard = pic.GetMeanValue255();
+    Print("Automatic graycard value: %d\n", param.grayCard); }
   // Save important parameters for later conversion:
   linear = param.gridLinear;
   target = param.grayCard;
   smin   = u_int32_t(65536.0 / param.colorDivisor + 0.5);
   smax   = u_int32_t(65536.0 * param.colorFactor  + 0.5);
+  // Calculate the best grid:
+  converter.Reset(&pic, nx, ny, linear);
+  converter.GetRgbMap(rgbMap);
 }
 
 // ----------------------------------------------------------------------------
@@ -1095,15 +745,14 @@ void Grid::Convert(Picture& src, Picture& dst) {
   double   facDepth = outDepth / double(srcDepth), z;
   int      channel;
   pixel_t *ps, *pd;
-  color_t *rgb1, *rgb2;
-  Cubic2<color_t> cub(mx, 3, my, oy);
+  Interpolation2<color_t> inter(linear, mx, 3, my, oy);
   dst.Reset(width, height, dstDepth);
   for (iy=0, ps=src.pixel, pd=dst.pixel; iy < height; ++iy) {
-    rgb2 = rgbMap + oy * cub.cy(scaley * double(iy));
+    inter.cy.Set(scaley * double(iy));
     for (ix=0; ix < width; ++ix) {
-      rgb1 = rgb2 + 3 * cub.cx(scalex * double(ix));
+      inter.cx.Set(scalex * double(ix));
       for (channel=0; channel < 3; ++channel) {
-        z  = cub(rgb1++) / 65535.0;
+        z  = inter(rgbMap + channel) / 65535.0;
         z  = fac * z <= gray ? fac : div * z >= gray ? div : gray / z;
         z *= facDepth * double(*ps++);
         if      (z < 0.0)       z = 0.0;
@@ -1143,25 +792,4 @@ void Main() {
       grid.Convert(src, dst);
       if (*param.destPicName)  dst.Write(param.destPicName);
       else                     dst.Write("stdout", stdout); } }
-}
-
-// ============================================================================
-
-// Main program to supply command line args, catch errors and
-// call the main routine:
-
-int main(int argc, char *argv[]) {
-  try {
-    try {
-      param(argc, argv);
-      Main();
-    }
-    // Catch exception from 'new' operator:
-    catch (std::bad_alloc& ba) { throw "Out of memory"; }
-  }
-  catch (const char *msg) {
-    fprintf(stderr, "!!! Error in %s:\n!!! %s!\n", param.prgName, msg);
-    return 1;
-  }
-  return 0;
 }
