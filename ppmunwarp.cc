@@ -644,7 +644,7 @@ void Mesh::Seed()
     if (bb >= 0.0 && (best < 0.0 || best > bb)) {
       for (j=0,best=bb; j < 9; ++j) iBest[j] = ind[j]; } }
   // This shouldn't happen too often:
-  if (best <= 0.0) throw "Calibration points are too distorted";
+  //  if (best <= 0.0) throw "Calibration points are too distorted";
   // Now 'iBest' contains the indices of the detected seed cell.
   // Rotate cell by 90 degrees if neccessary:
   dx = x[iBest[1]] - x[iBest[2]];  if (dx < 0) dx = -dx;

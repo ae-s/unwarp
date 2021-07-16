@@ -1,17 +1,27 @@
 
 # These are rules which don't correspond to an actual file
-.PHONY: calibrate cal-whitepoint flatten all
+.PHONY: calibrate cal-whitepoint flatten all tiffs
 
 export MAGICK_TMPDIR=/tmp/3
-TOOLDIR=/idk/astrid/unwarp
+TOOLDIR=/home/astrid/bookscan/unwarp
 
 # We maybe don't want to keep all these huge bitmaps lying around
 #.INTERMEDIATE: out/%.ppm orig/%.ppm
 
 # There is a tool ... which make knows how to compile ...
-$(TOOLDIR)/ppmunwarp: $(TOOLDIR)/ppmunwarp.cc
 
-$(TOOLDIR)/ppmwhitebalance: $(TOOLDIR)/ppmwhitebalance.cc
+$(TOOLDIR)/ppmroselib.o:  $(TOOLDIR)/ppmroselib.cc $(TOOLDIR)/ppmroselib.h
+#	g++ -Wall -O3 -c $(TOOLDIR)/ppmroselib.cc
+
+$(TOOLDIR)/ppmunwarp:  $(TOOLDIR)/ppmunwarp.cc $(TOOLDIR)/ppmroselib.o $(TOOLDIR)/ppmroselib.h
+#	g++ -Wall -O3 -o $(TOOLDIR)/ppmunwarp $(TOOLDIR)/ppmroselib.o $(TOOLDIR)/ppmunwarp.cc
+
+$(TOOLDIR)/ppmwhitebalance:  $(TOOLDIR)/ppmwhitebalance.cc $(TOOLDIR)/ppmroselib.o $(TOOLDIR)/ppmroselib.h
+#	g++ -Wall -O3 -o $(TOOLDIR)/ppmwhitebalance $(TOOLDIR)/ppmroselib.o $(TOOLDIR)/ppmwhitebalance.cc
+
+#clean:
+#	rm -f ppmroselib.o ppmunwarp ppmwhitebalance
+
 
 # Calibration requires the creation of an even and an odd deformation
 # map.  This indirectly requires the files `even.jpg' and `odd.jpg'.
@@ -60,7 +70,7 @@ cal-whitepoint: cal-even.white cal-odd.white $(TOOLDIR)/ppmwhitebalance
 		-d cal-`echo $* | sed -e 's/.*\(.\)/\1/' -e 's/[02468]/even/' -e 's/[13579]/odd/' `.white
 
 %.cropinfo: %.wht.ppm
-	convert $< -virtual-pixel edge -blur 0x30 -fuzz 20% -trim -format '%wx%h%O' info: > $*.cropinfo
+	convert $< -virtual-pixel edge -blur 0x30 -fuzz 25% -trim -format '%wx%h%O' info: > $*.cropinfo
 
 %.out.jpg: %.wht.ppm %.cropinfo
 	convert $< -crop `cat $*.cropinfo` +repage \
@@ -68,10 +78,17 @@ cal-whitepoint: cal-even.white cal-odd.white $(TOOLDIR)/ppmwhitebalance
 		-density `cat $*.dpi` \
 		-quality 95 $@
 
+out/%.tif: %.wht.ppm
+	convert $< -rotate `echo $* | sed -e 's/.*\(.\)/\1/' -e '/^[02468]$$/{s/.*/270/;q}' -e '/^[13579]$$/{s/.*/90/;q}' ` \
+		-density `cat $*.dpi` \
+		$@
+
 out/%.pdf: %.out.jpg
 	convert $< $@
 
 flatten: $(addprefix out/,$(notdir $(addsuffix .pdf,$(basename $(wildcard in/[0-9]*.jpg)))))
+
+tiffs: $(addprefix out/,$(notdir $(addsuffix .tif,$(basename $(wildcard in/[0-9]*.jpg)))))
 
 out.pdf: flatten calibrate cal-whitepoint
 	pdfunite out/*.pdf $@
